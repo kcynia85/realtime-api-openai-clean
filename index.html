@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8" />
+  <title>OpenAI Realtime API - Czekanie na Sygnał</title>
+  <style>
+    body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; background-color: #f0f0f0; }
+    button { font-size: 1.5rem; padding: 1rem 2rem; cursor: pointer; }
+    #status { margin-top: 20px; font-style: italic; color: #555; }
+    canvas { border: 1px solid #ccc; margin-top: 10px; }
+  </style>
+</head>
+<body>
+
+  <button id="startBtn">START</button>
+  <div id="status">Gotowy.</div>
+  <canvas id="visualizer" width="300" height="100"></canvas>
+
+  <script>
+    const startBtn = document.getElementById('startBtn');
+    const statusDiv = document.getElementById('status');
+    const canvas = document.getElementById('visualizer');
+    const canvasCtx = canvas.getContext('2d');
+
+    let audioContext, analyser, microphone, recorderNode, ws;
+    
+    // *** ZMIANA LOGIKI: Kolejka i flaga gotowości ***
+    let audioQueue = [];
+    let isServerReady = false; // Czekamy na sygnał od serwera
+
+    // Funkcje wizualizacji (bez zmian)
+    function drawWave(dataArray) { canvasCtx.fillStyle='rgb(240, 240, 240)'; canvasCtx.fillRect(0,0,canvas.width,canvas.height); canvasCtx.lineWidth=2; canvasCtx.strokeStyle='rgb(0, 0, 255)'; canvasCtx.beginPath(); let sliceWidth=canvas.width/dataArray.length; let x=0; for(let i=0;i<dataArray.length;i++) { const v=dataArray[i]/128.0; const y=v*canvas.height/2; if(i===0){canvasCtx.moveTo(x,y);}else{canvasCtx.lineTo(x,y);} x+=sliceWidth;} canvasCtx.lineTo(canvas.width,canvas.height/2); canvasCtx.stroke(); }
+    function visualize() { if(!analyser)return; requestAnimationFrame(visualize); const dataArray=new Uint8Array(analyser.fftSize); analyser.getByteTimeDomainData(dataArray); drawWave(dataArray); }
+
+    async function start() {
+      startBtn.disabled = true;
+      statusDiv.textContent = 'Prośba o dostęp do mikrofonu...';
+      try {
+        // Resetowanie stanu przy każdym starcie
+        audioQueue = [];
+        isServerReady = false;
+        
+        await setupAudioCapture();
+        initializeWebSocket();
+      } catch (error) {
+        console.error("Błąd podczas uruchamiania:", error);
+        startBtn.disabled = false;
+      }
+    }
+    
+    function initializeWebSocket() {
+        statusDiv.textContent = 'Łączenie i oczekiwanie na gotowość serwera...';
+        ws = new WebSocket('ws://localhost:3001/ws');
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = () => {
+            console.log("Połączono z proxy. Czekam na pierwszą wiadomość od OpenAI...");
+        };
+
+        ws.onmessage = async (event) => {
+            // *** ZMIANA LOGIKI: Pierwsza wiadomość odblokowuje wysyłanie ***
+            if (!isServerReady) {
+                isServerReady = true;
+                console.log("Otrzymano sygnał 'go' od serwera. Rozpoczynam wysyłanie audio.");
+                statusDiv.textContent = "Sesja aktywna. Możesz mówić!";
+                
+                // Opróżnij bufor z audio, które zebrało się podczas czekania
+                console.log(`Wysyłanie ${audioQueue.length} zbuforowanych fragmentów...`);
+                while(audioQueue.length > 0) {
+                    const audioChunk = audioQueue.shift();
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(audioChunk);
+                    }
+                }
+                console.log("Bufor opróżniony.");
+            }
+            
+            // Normalne przetwarzanie wiadomości
+            if (event.data instanceof ArrayBuffer) {
+              console.log('Odebrano audio (binarnie), bajtów:', event.data.byteLength);
+              // Odtwarzanie audio...
+              const int16Array = new Int16Array(event.data);
+              const float32Array = new Float32Array(int16Array.length);
+              for (let i = 0; i < int16Array.length; i++) { float32Array[i] = int16Array[i] / 32768.0; }
+              const audioBuffer = audioContext.createBuffer(1, float32Array.length, 24000);
+              audioBuffer.getChannelData(0).set(float32Array);
+              const source = audioContext.createBufferSource();
+              source.buffer = audioBuffer;
+              source.connect(audioContext.destination);
+              source.start();
+            } else {
+              const data = JSON.parse(event.data);
+              console.log('Odebrano tekst (JSON):', data);
+            }
+        };
+
+        ws.onerror = (err) => console.error('WebSocket error:', err);
+        ws.onclose = (event) => {
+            console.log(`WebSocket zamknięty: ${event.code} ${event.reason}`);
+            statusDiv.textContent = `Połączenie zamknięte. Kod: ${event.code}`;
+            startBtn.disabled = false;
+            isServerReady = false; // Reset flagi
+        };
+    }
+
+    async function setupAudioCapture() {
+      audioContext = new AudioContext({ sampleRate: 24000 });
+      analyser = audioContext.createAnalyser();
+      analyser.fftSize = 2048;
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      microphone = audioContext.createMediaStreamSource(stream);
+      
+      const workletCode = `class RecorderProcessor extends AudioWorkletProcessor { process(inputs) { const i = inputs[0]; if (i && i.length > 0) { this.port.postMessage(i[0]); } return true; } } registerProcessor('recorder-processor', RecorderProcessor);`;
+      const blob = new Blob([workletCode], { type: 'application/javascript' });
+      await audioContext.audioWorklet.addModule(URL.createObjectURL(blob));
+      recorderNode = new AudioWorkletNode(audioContext, 'recorder-processor');
+      
+      recorderNode.port.onmessage = (event) => {
+        const floatSamples = event.data;
+        const pcm16 = new Int16Array(floatSamples.length);
+        for (let i = 0; i < floatSamples.length; i++) {
+          let s = Math.max(-1, Math.min(1, floatSamples[i]));
+          pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+
+        // *** ZMIANA LOGIKI: Buforuj audio, dopóki serwer nie jest gotowy ***
+        if (isServerReady && ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(pcm16.buffer);
+        } else {
+          audioQueue.push(pcm16.buffer);
+        }
+      };
+      
+      microphone.connect(analyser);
+      microphone.connect(recorderNode);
+      visualize();
+    }
+
+    startBtn.addEventListener('click', start);
+  </script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+{
+  "dependencies": {
+<<<<<<< HEAD
+    "git-filter-repo": "^0.0.30",
+=======
+>>>>>>> d852d0a (Initial project commit)
+    "openai-realtime-api": "^1.0.7",
+    "ws": "^8.18.2"
+  }
+}
